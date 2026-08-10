@@ -24,6 +24,8 @@
 #include "operations/fusion/linear/linear.h"
 #include "operations/fusion/linear/linear_parallel.h"
 #include "operations/fusion/norm/norm_linear.h"
+#include "operations/aclrt/ops/aclrt_capture_event.h"
+#include "operations/fusion/moe/moe_shared_expert.h"
 
 namespace atb_speed {
 namespace common {
@@ -114,6 +116,12 @@ struct SparseMoeParam {
     bool mixSharedRouting = false;
     bool enableIndexGmm = false;
     bool enableInitRoutingV3 = false;
+    bool enableSharedExpertOverlap = false;
+    SharedExpertParam sharedExpertParam;
+    std::shared_ptr<CaptureEventState> beforeDispatchEvent;
+    std::shared_ptr<CaptureEventState> beforeCombineEvent;
+    std::shared_ptr<CaptureEventState> sharedExpertCompletionEvent;
+    std::string overlapEventPrefix;
 };
 
 /// This function creates the graph of the MoE of a model.

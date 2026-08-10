@@ -18,9 +18,30 @@
 #include <memory>
 #include "atb_speed/log.h"
 #include "moe_shared_expert.h"
+#include "operations/aclnn/ops/dynamic_quant_operation.h"
 
 namespace atb_speed {
 namespace common {
+
+namespace {
+
+LinearQuantType GetSharedExpertGateUpQuantType(const SharedExpertParam &param)
+{
+    return GetLinearQuantType(
+        param.denseQuantType == atb_speed::common::PackQuantType::PACK_QUANT_UNDEFINED ?
+            param.packQuantType : param.denseQuantType,
+        param.mlpLinearQuantType[SHARED_MOE_GATE_LINEAR_INDEX], false);
+}
+
+bool UseMainStreamGateUpDynamicQuant(const SharedExpertParam &param)
+{
+    const LinearQuantType quantType = GetSharedExpertGateUpQuantType(param);
+    return param.enableGateUpDynamicQuantOnMainStream &&
+        !param.enablePreNormQuantForSharedExperts &&
+        (quantType == LINEAR_W8A8_DYNAMIC_QUANT || quantType == LINEAR_W4A8_DYNAMIC_QUANT);
+}
+
+}  // namespace
 
 std::map<std::string, std::vector<std::string>> GetSharedExpertInTensorCandidates()
 {
@@ -107,19 +128,20 @@ atb::Status CreateLinear(const SharedExpertParam &param, atb::GraphParam &opGrap
     linearParam.hasBias = false;
     linearParam.isBF16 = param.isBF16;
     linearParam.transposeType = param.mlpLinearTransposeType.at(SHARED_MOE_GATE_LINEAR_INDEX);
-    linearParam.quantType = GetLinearQuantType(
-        param.denseQuantType == atb_speed::common::PackQuantType::PACK_QUANT_UNDEFINED \
-            ? param.packQuantType : param.denseQuantType,
-        param.mlpLinearQuantType[SHARED_MOE_GATE_LINEAR_INDEX], false);
+    const LinearQuantType gateUpQuantType = GetSharedExpertGateUpQuantType(param);
+    const bool useMainStreamDynamicQuant = UseMainStreamGateUpDynamicQuant(param);
+    linearParam.quantType = gateUpQuantType;
     linearParam.quantGroupSize = param.quantGroupSize;
-    // enable prenormquant, skip quant in fusionlinear
-    linearParam.enableSwiGLUQuantForSharedExperts = param.enablePreNormQuantForSharedExperts;
+    // Prequantized shared-expert input skips FusionLinear's internal quantization.
+    linearParam.enableSwiGLUQuantForSharedExperts =
+        param.enablePreNormQuantForSharedExperts || useMainStreamDynamicQuant;
     if (param.enableCVOverlap) {
         linearParam.enableCVOverlap = true;
     }
     CHECK_OPERATION_STATUS_RETURN(FusionLinear(linearParam, &linearNode.operation));
     linearNode.inTensorIds = {
-        GetTensorIdx(tensorMap, "in_hidden_states"),
+        GetTensorIdx(tensorMap, useMainStreamDynamicQuant ?
+            "intermediate_gate_up_quant_input" : "in_hidden_states"),
         GetTensorIdx(tensorMap, "in_mlp_gate_up_weight"),
         GetTensorIdx(tensorMap, "in_mlp_gate_up_scale"),
         GetTensorIdx(tensorMap, "in_mlp_gate_up_offset"),
@@ -127,6 +149,9 @@ atb::Status CreateLinear(const SharedExpertParam &param, atb::GraphParam &opGrap
         GetTensorIdx(tensorMap, "in_mlp_gate_up_bias"),
         GetTensorIdx(tensorMap, "in_mlp_gate_up_compress_idx"),
     };
+    if (useMainStreamDynamicQuant) {
+        linearNode.inTensorIds.push_back(GetTensorIdx(tensorMap, "intermediate_gate_up_quant_scale"));
+    }
     linearNode.outTensorIds = {GetTensorIdx(tensorMap, "intermediate_matmul_gate_up_out")};
     opGraph.nodes.push_back(linearNode);
     ATB_SPEED_LOG_DEBUG("Gate up projection calculation success");
@@ -316,6 +341,61 @@ atb::Status CreateActivationBlock(const SharedExpertParam &param,
 
     ATB_SPEED_LOG_DEBUG("ActivationBlock calculation success");
     return atb::NO_ERROR;
+}
+
+namespace {
+
+atb::Status SetNodeStream(atb::GraphParam &opGraph, size_t beginNodeIndex, uint64_t streamId)
+{
+    for (size_t nodeIndex = beginNodeIndex; nodeIndex < opGraph.nodes.size(); ++nodeIndex) {
+        CHECK_OPERATION_STATUS_RETURN(
+            atb::SetExecuteStreamId(opGraph.nodes.at(nodeIndex).operation, streamId));
+    }
+    return atb::NO_ERROR;
+}
+
+}  // namespace
+
+atb::Status AddSharedExpertGateUpQuantNode(
+    const SharedExpertParam &param, atb::GraphParam &opGraph,
+    std::map<std::string, uint32_t> &tensorMap)
+{
+    if (!UseMainStreamGateUpDynamicQuant(param)) {
+        return atb::NO_ERROR;
+    }
+    atb::Node dynamicQuantNode;
+    dynamicQuantNode.operation = new atb_speed::common::DynamicQuantOperation(
+        "SharedExpertGateUpDynamicQuant");
+    dynamicQuantNode.inTensorIds = {GetTensorIdx(tensorMap, "in_hidden_states")};
+    dynamicQuantNode.outTensorIds = {
+        GetTensorIdx(tensorMap, "intermediate_gate_up_quant_input"),
+        GetTensorIdx(tensorMap, "intermediate_gate_up_quant_scale")};
+    opGraph.nodes.push_back(dynamicQuantNode);
+    return atb::NO_ERROR;
+}
+
+atb::Status AddSharedExpertGateUpNodes(
+    const SharedExpertParam &param, atb::GraphParam &opGraph,
+    std::map<std::string, uint32_t> &tensorMap, uint64_t streamId)
+{
+    const size_t beginNodeIndex = opGraph.nodes.size();
+    CHECK_OPERATION_STATUS_RETURN(CreateLinear(param, opGraph, tensorMap));
+    CHECK_OPERATION_STATUS_RETURN(CreateActivationBlock(param, opGraph, tensorMap));
+    return SetNodeStream(opGraph, beginNodeIndex, streamId);
+}
+
+atb::Status AddSharedExpertDownNodes(
+    const SharedExpertParam &param, atb::GraphParam &opGraph,
+    std::map<std::string, uint32_t> &tensorMap, uint64_t streamId)
+{
+    const size_t beginNodeIndex = opGraph.nodes.size();
+    CHECK_OPERATION_STATUS_RETURN(CreateLinearDown(param, opGraph, tensorMap));
+    if (param.hasSharedExpertGate) {
+        CHECK_OPERATION_STATUS_RETURN(CreateSharedExpertGate(param, opGraph, tensorMap));
+        CHECK_OPERATION_STATUS_RETURN(CreateActivationSigmoid(opGraph, tensorMap));
+        CHECK_OPERATION_STATUS_RETURN(CreateElewiseMul2(opGraph, tensorMap));
+    }
+    return SetNodeStream(opGraph, beginNodeIndex, streamId);
 }
 
 atb::Status CreateSharedExpertOperation(const SharedExpertParam &param, atb::Operation **operation)

@@ -38,6 +38,7 @@ struct SharedExpertParam {
     bool hasSharedExpertGate = true;  /// A flag indicating whether there is routing mechanism for shared experts
     bool enableSwiGLUQuantForSharedExperts = false;
     bool enablePreNormQuantForSharedExperts = false;
+    bool enableGateUpDynamicQuantOnMainStream = false;
     bool supportSwiGLU = true;  /// A flag indicating whether the device supports SwiGlu operator
     bool isBF16 = false; /// A flag indicating whether the model runs on bfloat16
     bool enableCVOverlap = false; /// A flag indicating whether the model use cube and vector parallel
@@ -60,6 +61,18 @@ std::map<std::string, uint32_t> ConstructTensorMap(
 /// \return A flag that indicates whether the opertaion is successfully created or not.
 atb::Status CreateSharedExpertOperation(
     const SharedExpertParam &param, atb::Operation **operation);
+
+atb::Status AddSharedExpertGateUpNodes(
+    const SharedExpertParam &param, atb::GraphParam &opGraph,
+    std::map<std::string, uint32_t> &tensorMap, uint64_t streamId);
+
+atb::Status AddSharedExpertGateUpQuantNode(
+    const SharedExpertParam &param, atb::GraphParam &opGraph,
+    std::map<std::string, uint32_t> &tensorMap);
+
+atb::Status AddSharedExpertDownNodes(
+    const SharedExpertParam &param, atb::GraphParam &opGraph,
+    std::map<std::string, uint32_t> &tensorMap, uint64_t streamId);
 } // namespace common
 } // namespace atb_speed
 #endif

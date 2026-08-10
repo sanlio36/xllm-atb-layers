@@ -18,6 +18,8 @@
 #include <atb/atb_infer.h>
 #include "atb_speed/utils/operation_util.h"
 #include "atb_speed/log.h"
+#include "operations/aclrt/ops/aclrt_capture_event.h"
+#include "operations/fusion/moe/moe_shared_expert.h"
 #include "operations/fusion/linear/linear.h"
 #include "operations/fusion/linear/linear_parallel.h"
 #include "operations/fusion/norm/norm_linear.h"
@@ -80,6 +82,12 @@ struct MoeMlpParam {
     int64_t numDanglingSharedExperts = 0;
     uint32_t numOfRedundantExpert = 0;
     bool enableIndexGmm = false;
+    bool enableSharedExpertOverlap = false;
+    SharedExpertParam sharedExpertParam;
+    std::shared_ptr<CaptureEventState> beforeDispatchEvent;
+    std::shared_ptr<CaptureEventState> beforeCombineEvent;
+    std::shared_ptr<CaptureEventState> sharedExpertCompletionEvent;
+    std::string overlapEventPrefix;
 };
 
 /// This funciton creates a sub-graph that performs the FFN of a model with MoE structure

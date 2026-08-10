@@ -22,6 +22,7 @@
 #include "operations/fusion/mlp/mlp.h"
 #include "operations/fusion/moe/sparse_moe.h"
 #include "operations/aclnn/ops/inplace_nan_to_num_operation.h"
+#include "operations/aclrt/ops/aclrt_capture_event.h"
 #include "operations/aclrt/ops/aclrt_cmo_async.h"
 #include "operations/fusion/moe/moe_shared_expert.h"
 #include "models/deepseekv2/operation/latent_attention.h"
@@ -39,6 +40,45 @@ static const uint64_t STREAM1 = 1;
 static const uint64_t NUM2 = 2;
 static const float FLOAT16_MAX = 65504.0f;
 static const float FLOAT16_MIN = -65504.0f;
+
+namespace {
+
+struct SharedExpertOverlapContext {
+    std::shared_ptr<atb_speed::common::CaptureEventState> beforeDispatchEvent;
+    std::shared_ptr<atb_speed::common::CaptureEventState> beforeCombineEvent;
+    std::shared_ptr<atb_speed::common::CaptureEventState> completionEvent;
+    std::string eventPrefix;
+};
+
+bool IsSharedExpertOverlapEnabled(const DecoderLayerParam &param)
+{
+    return !param.isPrefill && param.enableSharedExpertOverlap && param.enableDispatchCombineV2 &&
+        param.isDynamicEp && param.expertParallelDegree == 2 && !param.isDenseLayer && param.hasSharedExpert;
+}
+
+atb::Status InitializeSharedExpertOverlap(
+    const DecoderLayerParam &param, SharedExpertOverlapContext &overlapContext)
+{
+    if (!IsSharedExpertOverlapEnabled(param)) {
+        return atb::NO_ERROR;
+    }
+    if (param.enableCVOverlap || param.enableMlaPrefetch || param.hasSharedExpertGate) {
+        ATB_SPEED_LOG_ERROR(
+            "EPLv2 shared expert overlap requires an unused stream 1 and no shared expert gate");
+        return atb::ERROR_INVALID_PARAM;
+    }
+    overlapContext.eventPrefix =
+        "shared_expert_layer_" + std::to_string(param.layerId);
+    CHECK_OPERATION_STATUS_RETURN(
+        atb_speed::common::CreateCaptureEvent(overlapContext.beforeDispatchEvent));
+    CHECK_OPERATION_STATUS_RETURN(
+        atb_speed::common::CreateCaptureEvent(overlapContext.beforeCombineEvent));
+    CHECK_OPERATION_STATUS_RETURN(
+        atb_speed::common::CreateCaptureEvent(overlapContext.completionEvent));
+    return atb::NO_ERROR;
+}
+
+}  // namespace
 
 void SetDeepseekV2LayerInTensorDefaultCandidates(
     std::map<std::string, std::vector<std::string>> &deepseekV2LayerInTensorCandidates)
@@ -830,7 +870,7 @@ int64_t SetAllGather(atb::GraphParam &opGraph, const DecoderLayerParam &param,
 atb::Status SetAllGatherCCOverlap(atb::GraphParam &opGraph, const DecoderLayerParam &param,
     bool is_auxiliary, uint64_t stream_id)
 {
-    if (param.enableSharedExpertOverlap) {
+    if (param.enableSharedExpertOverlap && !IsSharedExpertOverlapEnabled(param)) {
         if (!param.isPrefill || !param.enableGatingDp) {
             CHECK_OPERATION_STATUS_RETURN(atb_speed::common::CreateRecordWithoutNodeId(
                 opGraph, atb_speed::EventAction::POP, atb_speed::common::COMM_CONTROL));
@@ -1029,7 +1069,8 @@ int64_t SetExpertRoutingMapSlice(
     return atb::NO_ERROR;
 }
 
-atb::Status SetSparseMoeParam(atb_speed::common::SparseMoeParam &sparseMoeParam, const DecoderLayerParam &param)
+atb::Status SetSparseMoeParam(atb_speed::common::SparseMoeParam &sparseMoeParam, const DecoderLayerParam &param,
+                             const SharedExpertOverlapContext &overlapContext)
 {
     sparseMoeParam.isBF16 = param.isBF16;
     sparseMoeParam.gateUpTransposeB = param.moeLinearTransposeType[MOE_GATEUP_LINEAR_INDEX];
@@ -1077,13 +1118,16 @@ atb::Status SetSparseMoeParam(atb_speed::common::SparseMoeParam &sparseMoeParam,
     sparseMoeParam.numDanglingSharedExperts = param.numDanglingSharedExperts;
     sparseMoeParam.maxDecodeDpTokenSize = param.maxDecodeDpTokenSize;
     sparseMoeParam.enableMoeDistribute = !param.isPrefill && param.enableAllToAllMC2 && param.isDynamicEp;
-    sparseMoeParam.enableDispatchCombineV2 = param.enableDispatchCombineV2;
+    sparseMoeParam.enableDispatchCombineV2 = !param.isPrefill && param.enableDispatchCombineV2;
     sparseMoeParam.enableGatingDp = param.enableGatingDp && param.isPrefill;  // h3p gatingdp for moe
     sparseMoeParam.enableGatingShift = param.enableGatingDp && !param.isPrefill;  // h3p gatingshift for decode
     sparseMoeParam.enableGatingOverlap = sparseMoeParam.enableGatingDp &&
                                         param.enableSharedExpertOverlap;  // h3p Gating overlap
     sparseMoeParam.mixSharedRouting = param.mixSharedRouting;
     sparseMoeParam.enableInitRoutingV3 = !param.isPrefill && !param.mapping.Get(base::MOE_EP).IsEnabled();
+    sparseMoeParam.beforeDispatchEvent = overlapContext.beforeDispatchEvent;
+    sparseMoeParam.beforeCombineEvent = overlapContext.beforeCombineEvent;
+    sparseMoeParam.overlapEventPrefix = overlapContext.eventPrefix;
 
     return atb::NO_ERROR;
 }
@@ -1117,13 +1161,35 @@ atb::Status SetSparseMoeCommParam(atb_speed::common::SparseMoeParam &sparseMoePa
     return atb::NO_ERROR;
 }
 
-int64_t SetMoe(atb::GraphParam &opGraph, const DecoderLayerParam &param, std::map<std::string, uint32_t> tensorMap, 
-    bool is_auxiliary, uint64_t stream_id)
+atb::Status SetSharedExpertParam(atb_speed::common::SharedExpertParam &sharedExpertParam,
+                                 const DecoderLayerParam &param);
+
+int64_t SetMoe(atb::GraphParam &opGraph, const DecoderLayerParam &param, std::map<std::string, uint32_t> tensorMap,
+    bool is_auxiliary, uint64_t stream_id, const SharedExpertOverlapContext &overlapContext)
 {
     atb::Node moeNode;
     atb_speed::common::SparseMoeParam sparseMoeParam;
-    SetSparseMoeParam(sparseMoeParam, param);
+    SetSparseMoeParam(sparseMoeParam, param, overlapContext);
     SetSparseMoeCommParam(sparseMoeParam, param);
+    const bool enableEplv2Overlap = IsSharedExpertOverlapEnabled(param);
+    if (enableEplv2Overlap) {
+        sparseMoeParam.enableSharedExpertOverlap = true;
+        CHECK_OPERATION_STATUS_RETURN(SetSharedExpertParam(
+            sparseMoeParam.sharedExpertParam, param));
+        const atb_speed::common::LinearQuantType sharedGateUpQuantType =
+            atb_speed::common::GetLinearQuantType(
+                sparseMoeParam.sharedExpertParam.denseQuantType ==
+                        atb_speed::common::PackQuantType::PACK_QUANT_UNDEFINED ?
+                    sparseMoeParam.sharedExpertParam.packQuantType :
+                    sparseMoeParam.sharedExpertParam.denseQuantType,
+                sparseMoeParam.sharedExpertParam.mlpLinearQuantType[
+                    atb_speed::common::SHARED_MOE_GATE_LINEAR_INDEX], false);
+        sparseMoeParam.sharedExpertParam.enableGateUpDynamicQuantOnMainStream =
+            !sparseMoeParam.sharedExpertParam.enablePreNormQuantForSharedExperts &&
+            (sharedGateUpQuantType == atb_speed::common::LINEAR_W8A8_DYNAMIC_QUANT ||
+             sharedGateUpQuantType == atb_speed::common::LINEAR_W4A8_DYNAMIC_QUANT);
+        sparseMoeParam.sharedExpertCompletionEvent = overlapContext.completionEvent;
+    }
     CHECK_OPERATION_STATUS_RETURN(atb_speed::common::CreateSparseMoeOperation(sparseMoeParam, &moeNode.operation));
     std::vector<std::string> moeInTensorNames;
     std::string tmp = is_auxiliary ? "intermediate_selfattention_norm_out_auxiliary" : "intermediate_selfattention_norm_out";
@@ -1172,9 +1238,36 @@ int64_t SetMoe(atb::GraphParam &opGraph, const DecoderLayerParam &param, std::ma
         moeInTensorNames.push_back("mix_shared_routing_weight");
         moeInTensorNames.push_back("mix_shared_routing_expert");
     }
+    if (enableEplv2Overlap) {
+        const std::string sharedExpertWeightSuffix = param.hasP2DWeight ? "_tp" : "";
+        moeInTensorNames.push_back(
+            !param.hasP2DWeight && param.enableSharedExpertDp ?
+                (is_auxiliary ? "intermediate_selfattention_norm_out_partial_auxiliary" :
+                                "intermediate_selfattention_norm_out_partial") : tmp);
+        const std::vector<std::string> sharedExpertWeightNames = {
+            "in_mlp_gateup_weight_shared_expert" + sharedExpertWeightSuffix,
+            "in_mlp_gateup_bias_shared_expert" + sharedExpertWeightSuffix,
+            "in_mlp_gateup_descale_shared_expert" + sharedExpertWeightSuffix,
+            "in_mlp_gateup_offset_shared_expert" + sharedExpertWeightSuffix,
+            "in_mlp_gateup_scale_shared_expert" + sharedExpertWeightSuffix,
+            "in_mlp_gateup_compress_idx_shared_expert" + sharedExpertWeightSuffix,
+            "in_mlp_down_weight_shared_expert" + sharedExpertWeightSuffix,
+            "in_mlp_down_bias_shared_expert" + sharedExpertWeightSuffix,
+            "in_mlp_down_descale_shared_expert" + sharedExpertWeightSuffix,
+            "in_mlp_down_offset_shared_expert" + sharedExpertWeightSuffix,
+            "in_mlp_down_scale_shared_expert" + sharedExpertWeightSuffix,
+            "in_mlp_down_compress_idx_shared_expert" + sharedExpertWeightSuffix};
+        moeInTensorNames.insert(
+            moeInTensorNames.end(), sharedExpertWeightNames.begin(), sharedExpertWeightNames.end());
+    }
     moeNode.inTensorIds = atb_speed::common::GetTensorIdxList(tensorMap, moeInTensorNames);
     moeNode.outTensorIds = atb_speed::common::GetTensorIdxList(tensorMap, 
         {is_auxiliary ? "intermediate_moe_out_with_shared_auxiliary" : "intermediate_moe_out_with_shared"});
+    if (enableEplv2Overlap) {
+        moeNode.outTensorIds.push_back(atb_speed::common::GetTensorIdx(
+            tensorMap, {is_auxiliary ? "intermediate_shared_expert_out_auxiliary" :
+                                       "intermediate_shared_expert_out"}));
+    }
     if (param.enableExpertCumSumOutput) {
         moeNode.outTensorIds.push_back(atb_speed::common::GetTensorIdx(tensorMap, {"out_gmm_cumsum_list"}));
     }
@@ -1624,15 +1717,31 @@ atb::Status CalculateCommType(DecoderLayerParam &param)
 // }
 
 atb::Status SetFFN(std::map<std::string, uint32_t> &tensorMap,
-    const DecoderLayerParam &param, atb::GraphParam &opGraph, bool is_auxiliary, uint64_t stream_id)
+    const DecoderLayerParam &param, atb::GraphParam &opGraph, bool is_auxiliary,
+    uint64_t stream_id, const SharedExpertOverlapContext &overlapContext)
 {
     if (param.isDenseLayer) {
         CHECK_OPERATION_STATUS_RETURN(SetMlpExpert(opGraph, param, tensorMap, is_auxiliary, stream_id));
     } else {
-        if (param.hasSharedExpert && !param.enableSharedExpertOverlap) {
-            CHECK_OPERATION_STATUS_RETURN(SetSharedExpert(opGraph, param, tensorMap, is_auxiliary, stream_id));
+        const bool enableEplv2Overlap = IsSharedExpertOverlapEnabled(param);
+        if (enableEplv2Overlap) {
+            if (is_auxiliary || overlapContext.beforeDispatchEvent == nullptr ||
+                overlapContext.beforeCombineEvent == nullptr ||
+                overlapContext.completionEvent == nullptr) {
+                ATB_SPEED_LOG_ERROR("EPLv2 shared expert overlap has invalid graph or events");
+                return atb::ERROR_INVALID_PARAM;
+            }
+        } else if (param.hasSharedExpert && !param.enableSharedExpertOverlap) {
+            CHECK_OPERATION_STATUS_RETURN(
+                SetSharedExpert(opGraph, param, tensorMap, is_auxiliary, stream_id));
         }
-        CHECK_OPERATION_STATUS_RETURN(SetMoe(opGraph, param, tensorMap, is_auxiliary, stream_id));
+        CHECK_OPERATION_STATUS_RETURN(
+            SetMoe(opGraph, param, tensorMap, is_auxiliary, stream_id, overlapContext));
+        if (!enableEplv2Overlap && param.enableSharedExpertOverlap && param.hasSharedExpert &&
+            !param.attnAllGather) {
+            CHECK_OPERATION_STATUS_RETURN(atb_speed::common::CreateWaitWithoutNodeId(
+                opGraph, atb_speed::EventAction::POP, atb_speed::common::COMP_CONTROL));
+        }
         if (param.hasSharedExpert && !param.enableSharedExpertDp) {
             CHECK_OPERATION_STATUS_RETURN(AddExpertAdd(opGraph, param, tensorMap, is_auxiliary, stream_id));
         }
@@ -1797,19 +1906,24 @@ atb::Status SetPostAttnProcess(std::map<std::string, uint32_t> &tensorMap,
         }
         CHECK_OPERATION_STATUS_RETURN(SetSelfNorm(opGraph, param, tensorMap, is_auxiliary, stream_id));
     }
-    if (param.enableSharedExpertOverlap) {
+    const bool enableEplv2Overlap = IsSharedExpertOverlapEnabled(param);
+    if (param.enableSharedExpertOverlap && !enableEplv2Overlap) {
         CHECK_OPERATION_STATUS_RETURN(atb_speed::common::CreateRecordWithoutNodeId(
             opGraph, atb_speed::EventAction::PUSH, atb_speed::common::CC_START));
         CHECK_OPERATION_STATUS_RETURN(xllm::atb_utils::CreateNewStreamWaitWithoutNodeId(
             opGraph, atb_speed::EventAction::POP, atb_speed::common::CC_START));
     }
-    if (param.enableSharedExpertOverlap && !param.isDenseLayer && param.hasSharedExpert) {
-        CHECK_OPERATION_STATUS_RETURN(SetSharedExpert(opGraph, param, tensorMap, is_auxiliary, stream_id));
+    if (param.enableSharedExpertOverlap && !enableEplv2Overlap &&
+        !param.isDenseLayer && param.hasSharedExpert) {
+        CHECK_OPERATION_STATUS_RETURN(SetSharedExpert(
+            opGraph, param, tensorMap, is_auxiliary, stream_id));
         if (!param.isPrefill || !param.enableGatingDp) {
             CHECK_OPERATION_STATUS_RETURN(xllm::atb_utils::CreateNewStreamRecordWithoutNodeId(
                 opGraph, atb_speed::EventAction::PUSH, atb_speed::common::COMP_CONTROL));
-            CHECK_OPERATION_STATUS_RETURN(xllm::atb_utils::CreateNewStreamWaitWithoutNodeId(
-                opGraph, atb_speed::EventAction::PUSH, atb_speed::common::COMM_CONTROL));
+            if (param.attnAllGather) {
+                CHECK_OPERATION_STATUS_RETURN(xllm::atb_utils::CreateNewStreamWaitWithoutNodeId(
+                    opGraph, atb_speed::EventAction::PUSH, atb_speed::common::COMM_CONTROL));
+            }
         }
     }
     if (param.attnAllGather) {
@@ -1934,6 +2048,9 @@ atb::Status DecoderLayer(DecoderLayerParam &param, atb::Operation **operation)
         << "DSA top-k sharing does not support multi stream prefill yet.";
     std::map<std::string, uint32_t> tensorMap = ConstructTensorMap(
         param, opGraph.inTensorNum, opGraph.outTensorNum, opGraph.internalTensorNum);
+    SharedExpertOverlapContext overlapContext;
+    CHECK_OPERATION_STATUS_RETURN(
+        InitializeSharedExpertOverlap(param, overlapContext));
     ATB_SPEED_LOG_DEBUG("layer graph inTensorNum: " << opGraph.inTensorNum);
     ATB_SPEED_LOG_DEBUG("layer graph outTensorNum: " << opGraph.outTensorNum);
     ATB_SPEED_LOG_DEBUG("layer graph internalTensorNum: " << opGraph.internalTensorNum);
@@ -1949,12 +2066,14 @@ atb::Status DecoderLayer(DecoderLayerParam &param, atb::Operation **operation)
         CHECK_OPERATION_STATUS_RETURN(SetPostAttnProcess(tensorMap, param, opGraph, 1, 1));
         xllm::atb_utils::insert_push_events(opGraph);
 
-        CHECK_OPERATION_STATUS_RETURN(SetFFN(tensorMap, param, opGraph, 0, 0));
+        CHECK_OPERATION_STATUS_RETURN(SetFFN(
+            tensorMap, param, opGraph, 0, 0, overlapContext));
         // pop
         CHECK_OPERATION_STATUS_RETURN(SetPostMoeProcess(tensorMap, param, opGraph, 0, 1));
         xllm::atb_utils::insert_push_events(opGraph);
 
-        CHECK_OPERATION_STATUS_RETURN(SetFFN(tensorMap, param, opGraph, 1, 0));
+        CHECK_OPERATION_STATUS_RETURN(SetFFN(
+            tensorMap, param, opGraph, 1, 0, overlapContext));
         // pop
         CHECK_OPERATION_STATUS_RETURN(SetPostMoeProcess(tensorMap, param, opGraph, 1, 1));
         xllm::atb_utils::insert_push_events(opGraph);
@@ -1964,7 +2083,8 @@ atb::Status DecoderLayer(DecoderLayerParam &param, atb::Operation **operation)
      } else {
         CHECK_OPERATION_STATUS_RETURN(SetAttention(opGraph, param, tensorMap, 0, 0));
         CHECK_OPERATION_STATUS_RETURN(SetPostAttnProcess(tensorMap, param, opGraph, 0, 0));
-        CHECK_OPERATION_STATUS_RETURN(SetFFN(tensorMap, param, opGraph, 0, 0));
+        CHECK_OPERATION_STATUS_RETURN(SetFFN(
+            tensorMap, param, opGraph, 0, 0, overlapContext));
         CHECK_OPERATION_STATUS_RETURN(SetPostMoeProcess(tensorMap, param, opGraph, 0, 0));
      }
     opGraph.inferShapeFunc = [=] (const atb::SVector<atb::TensorDesc> &inTensorDescs,

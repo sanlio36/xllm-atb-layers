@@ -78,6 +78,15 @@ std::map<std::string, std::vector<std::string>> GetSparseMoeInTensorCandidates()
         },
         {"fp32_gate_input", {
             "in_hiddenstates_fp32"}
+        },
+        {"shared_expert_overlap", {
+            "in_hiddenstates_shared_expert",
+            "in_mlp_gateup_weight_shared_expert", "in_mlp_gateup_bias_shared_expert",
+            "in_mlp_gateup_descale_shared_expert", "in_mlp_gateup_offset_shared_expert",
+            "in_mlp_gateup_scale_shared_expert", "in_mlp_gateup_compress_idx_shared_expert",
+            "in_mlp_down_weight_shared_expert", "in_mlp_down_bias_shared_expert",
+            "in_mlp_down_descale_shared_expert", "in_mlp_down_offset_shared_expert",
+            "in_mlp_down_scale_shared_expert", "in_mlp_down_compress_idx_shared_expert"}
         }
     };
     return moeMlpInTensorCandidates;
@@ -152,6 +161,9 @@ std::map<std::string, uint32_t> ConstructTensorMap(
         "intermediate_router_logits", "intermediate_selected_experts"};
     std::vector<std::string> outTensorList = {"out_moe_rout"};
     AddTensorToList(moeMlpInTensorCandidates, "default", inTensorList);
+    if (param.enableSharedExpertOverlap) {
+        outTensorList.push_back("out_shared_expert");
+    }
     if (param.enableLoadBalance) {
         AddTensorToList(moeMlpInTensorCandidates, "force_load_balance", inTensorList);
     }
@@ -187,6 +199,9 @@ std::map<std::string, uint32_t> ConstructTensorMap(
     if (param.mixSharedRouting) {
         inTensorList.push_back("mix_shared_routing_weight");
         inTensorList.push_back("mix_shared_routing_expert");
+    }
+    if (param.enableSharedExpertOverlap) {
+        AddTensorToList(moeMlpInTensorCandidates, "shared_expert_overlap", inTensorList);
     }
     if (param.forceMoeFusedAddTopkAddNumFp32) {
         interTensorList.push_back(FUSED_ADD_TOPK_ADDNUM_FP32);
@@ -728,6 +743,12 @@ atb::Status SetDynamicExpertParam(atb_speed::common::DynamicEpMoEParam &dynamicE
     dynamicExpertParam.lcclMoeEpHcclComm = param.lcclMoeEpHcclComm;
     dynamicExpertParam.mixSharedRouting = param.mixSharedRouting;
     dynamicExpertParam.enableIndexGmm = param.enableIndexGmm;
+    dynamicExpertParam.enableSharedExpertOverlap = param.enableSharedExpertOverlap;
+    dynamicExpertParam.sharedExpertParam = param.sharedExpertParam;
+    dynamicExpertParam.beforeDispatchEvent = param.beforeDispatchEvent;
+    dynamicExpertParam.beforeCombineEvent = param.beforeCombineEvent;
+    dynamicExpertParam.sharedExpertCompletionEvent = param.sharedExpertCompletionEvent;
+    dynamicExpertParam.overlapEventPrefix = param.overlapEventPrefix;
     return atb::NO_ERROR;
 }
 
@@ -860,6 +881,21 @@ std::list<std::string> GetOutTensorName(const SparseMoeParam &param)
             nameList.push_back("in_moe_idx");
         }
     }
+    if (param.enableSharedExpertOverlap) {
+        nameList.push_back("in_hiddenstates_shared_expert");
+        nameList.push_back("in_mlp_gateup_weight_shared_expert");
+        nameList.push_back("in_mlp_gateup_bias_shared_expert");
+        nameList.push_back("in_mlp_gateup_descale_shared_expert");
+        nameList.push_back("in_mlp_gateup_offset_shared_expert");
+        nameList.push_back("in_mlp_gateup_scale_shared_expert");
+        nameList.push_back("in_mlp_gateup_compress_idx_shared_expert");
+        nameList.push_back("in_mlp_down_weight_shared_expert");
+        nameList.push_back("in_mlp_down_bias_shared_expert");
+        nameList.push_back("in_mlp_down_descale_shared_expert");
+        nameList.push_back("in_mlp_down_offset_shared_expert");
+        nameList.push_back("in_mlp_down_scale_shared_expert");
+        nameList.push_back("in_mlp_down_compress_idx_shared_expert");
+    }
     return nameList;
 }
 
@@ -878,6 +914,9 @@ atb::Status GetoutTensorIdx(
     SetDynamicExpertParam(dynamicExpertParam, param);
     atb_speed::common::CreateDynamicEpMoEOperation(dynamicExpertParam, &expertNode.operation);
     expertNode.outTensorIds = {GetTensorIdx(tensorMap, "out_moe_rout")};
+    if (param.enableSharedExpertOverlap) {
+        expertNode.outTensorIds.push_back(GetTensorIdx(tensorMap, "out_shared_expert"));
+    }
     if (param.enableExpertCumSumOutput) {
         expertNode.outTensorIds.push_back(GetTensorIdx(tensorMap, "out_gmm_cumsum_list"));
     }
@@ -1168,12 +1207,17 @@ atb::Status CreateSparseMoeOperation(const SparseMoeParam &param, atb::Operation
     opGraph.inferShapeFunc = [=](const atb::SVector<atb::TensorDesc> &inTensorDescs,
                                     atb::SVector<atb::TensorDesc> &outTensorDescs) {
         outTensorDescs.at(0) = inTensorDescs.at(0);
+        if (param.enableSharedExpertOverlap) {
+            outTensorDescs.at(1) = inTensorDescs.at(
+                GetTensorIdx(tensorMap, "in_hiddenstates_shared_expert"));
+        }
         if (param.enableExpertCumSumOutput) {
-            outTensorDescs.at(1) = atb::TensorDesc{};
-            outTensorDescs.at(1).format = ACL_FORMAT_ND;
-            outTensorDescs.at(1).shape.dimNum = 1;
-            outTensorDescs.at(1).dtype = ACL_INT64;
-            outTensorDescs.at(1).shape.dims[0] = param.numOfDeviceExperts;
+            const uint32_t outputIndex = param.enableSharedExpertOverlap ? 2 : 1;
+            outTensorDescs.at(outputIndex) = atb::TensorDesc{};
+            outTensorDescs.at(outputIndex).format = ACL_FORMAT_ND;
+            outTensorDescs.at(outputIndex).shape.dimNum = 1;
+            outTensorDescs.at(outputIndex).dtype = ACL_INT64;
+            outTensorDescs.at(outputIndex).shape.dims[0] = param.numOfDeviceExperts;
         }
 
         return atb::NO_ERROR;
