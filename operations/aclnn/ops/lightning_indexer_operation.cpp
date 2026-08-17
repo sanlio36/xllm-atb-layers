@@ -131,8 +131,26 @@ int LightningIndexerOperation::SetAclNNWorkspaceExecutor()
 int LightningIndexerOperation::ExecuteAclNNOp(uint8_t *workspace, aclrtStream &stream)
 {
     ATB_SPEED_LOG_DEBUG(opName_ << " ExecuteAclNNOp start");
-    int ret =
-        aclnnLightningIndexer(workspace, this->aclnnOpCache_->workspaceSize, this->aclnnOpCache_->aclExecutor, stream);
+    AclNNVariantPack &aclnnVariantPack = this->aclnnOpCache_->aclnnVariantPack;
+    if (aclnnVariantPack.aclAuxTensors.empty()) {
+        ATB_SPEED_LOG_ERROR(opName_ << " sparseValuesOut tensor is missing");
+        return atb::ERROR_INTERNAL_ERROR;
+    }
+
+    // The generic cache replay only updates tensors registered as graph
+    // outputs. Refresh the auxiliary sparseValuesOut address as well, otherwise
+    // a shape-cache hit can keep writing to a released output buffer.
+    int ret = aclSetOutputTensorAddr(this->aclnnOpCache_->aclExecutor,
+                                     1,
+                                     aclnnVariantPack.aclAuxTensors.at(0),
+                                     aclnnVariantPack.aclOutTensors.at(0)->atbTensor.deviceData);
+    if (ret != 0) {
+        ATB_SPEED_LOG_ERROR(opName_ << " update sparseValuesOut address failed, ret:" << ret);
+        return ret;
+    }
+
+    ret = aclnnLightningIndexer(
+        workspace, this->aclnnOpCache_->workspaceSize, this->aclnnOpCache_->aclExecutor, stream);
     ATB_SPEED_LOG_DEBUG(opName_ << " ExecuteAclNNOp end, ret:" << ret);
     return ret;
 }
